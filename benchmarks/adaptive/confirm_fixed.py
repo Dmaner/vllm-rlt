@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 
-from bench_adaptive import atomic_json, balanced_prompts, sha
+from bench_adaptive import atomic_json, balanced_prompts, plain, sha
 from run_suite import DEFAULT_REMOTE, HERE, OLD_REMOTE, correctness, fingerprint, load_results
 
 
@@ -244,6 +244,8 @@ def main():
                 confirm_script_sha256=sha(__file__), jobs=jobs,
                 selection_provenance=provenance, model_path=str(args.model),
                 rationale='short N256 results nominate a bounded shortlist; N2048 calibration selects winners')
+    # Compare the same representation atomic_json writes (notably integer keys).
+    plan = plain(plan)
     plan_path = args.output / 'confirm-fixed-plan.json'
     if plan_path.exists():
         if json.loads(plan_path.read_text()) != plan:
