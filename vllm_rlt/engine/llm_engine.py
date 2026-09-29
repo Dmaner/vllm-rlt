@@ -1,5 +1,8 @@
 from dataclasses import replace
+from time import perf_counter
 
+from vllm_rlt.adaptive import AdaptiveController, RoundFeedback, WindowMeasurement
+from vllm_rlt.adaptive_config import resolve_adaptive_config
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.memory import plan_cache
@@ -25,6 +28,7 @@ class LLMEngine:
         exit_config=None,
         execution_config=None,
         speculative_config=None,
+        adaptive_config=None,
     ):
         self.model = model
         cache_config = cache_config or CacheConfig()
@@ -33,6 +37,14 @@ class LLMEngine:
         config = model.config
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = execution_config or ExecutionConfig()
+        self.adaptive_controller = None
+        self._adaptive_window = None
+        if adaptive_config is not None:
+            if speculative_config is not None:
+                raise ValueError("adaptive_config cannot be combined with fixed speculative_config")
+            resolved = resolve_adaptive_config(adaptive_config, config)
+            self.adaptive_controller = AdaptiveController(resolved)
+            speculative_config = resolved.initial_speculative_config
         self.speculative_config = speculative_config
         if speculative_config is not None:
             if cache_config.layout != "last_exited":
@@ -95,6 +107,8 @@ class LLMEngine:
         ):
             raise ValueError("prefill_uva requires CUDA FA4 with last_exited KV")
         self.scheduler = Scheduler(scheduler_config, self.cache_manager, speculative_config)
+        if self.adaptive_controller is not None:
+            self.scheduler.speculation_plan_callback = self.adaptive_controller.plan
         self.speculative_runner = (
             SpeculativeRunner(model, self.cache_manager, speculative_config, self.execution_config)
             if speculative_config is not None
@@ -133,6 +147,8 @@ class LLMEngine:
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id must be a nonempty string")
         params = sampling_params or SamplingParams()
+        if self.adaptive_controller is not None and params.temperature != 0:
+            raise ValueError("adaptive speculation currently requires greedy temperature=0")
         config = self.model.config
         if not prompt_token_ids:
             raise ValueError("prompt must contain at least one token")
@@ -185,6 +201,9 @@ class LLMEngine:
         return self.scheduler.has_unfinished_requests
 
     def abort_request(self, request_id: str) -> RequestOutput:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.invalidate("request_aborted")
+            self._adaptive_window = None
         self.preemption.discard_snapshot(request_id)
         self.model_runner.release(request_id)
         self._pending_exit_signals.pop(request_id, None)
@@ -204,6 +223,7 @@ class LLMEngine:
                 self._pending_coda.clear()
                 self._inflight.clear()
                 raise
+        step_started = perf_counter() if self.adaptive_controller is not None else None
         batch = self.scheduler.schedule()
         self.last_schedule = batch
         if batch is None:
@@ -213,9 +233,29 @@ class LLMEngine:
             return []
         try:
             if batch.stage == Stage.SPECULATIVE:
-                return self._update_speculative(batch, self.speculative_runner.execute(batch))
-            result = self.model_runner.execute(batch)
-            return self._update(batch, result)
+                if batch.plan is not None:
+                    window_id = batch.plan.decision.window_id
+                    if self._adaptive_window is None or self._adaptive_window["id"] != window_id:
+                        self._adaptive_window = {
+                            "id": window_id, "started": step_started,
+                            "plan_ids": [], "committed": 0,
+                        }
+                outputs = self._update_speculative(batch, self.speculative_runner.execute(batch))
+            else:
+                if self.adaptive_controller is not None:
+                    # Mixed prefill/coda work is not a comparable measurement
+                    # of K/d decode cost. End the partial window; the external
+                    # end-to-end benchmark still includes all of this work.
+                    self.adaptive_controller.invalidate("non_speculative_stage")
+                    self._adaptive_window = None
+                result = self.model_runner.execute(batch)
+                outputs = self._update(batch, result)
+            if self.adaptive_controller is not None and not self.has_unfinished_requests():
+                # A later generate() must not charge arbitrary engine idle time
+                # or a fresh workload's prefill to the preceding action window.
+                self.adaptive_controller.invalidate("engine_idle")
+                self._adaptive_window = None
+            return outputs
         except Exception:
             # A failed execution may have partially written KV; invalidate the affected requests.
             for item in batch.items:
@@ -225,6 +265,7 @@ class LLMEngine:
 
     def _update_speculative(self, batch, results):
         outputs = []
+        committed, censored = [], []
         for item, result in zip(batch.items, results):
             request = item.request
             params = request.sampling_params
@@ -232,6 +273,7 @@ class LLMEngine:
             eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
             emitted = 0
             reason = None
+            remaining = params.max_tokens - len(request.generated_token_ids)
             for token in result.token_ids:
                 request.generated_token_ids.append(token)
                 request.exit_depths.append(self.speculative_config.target_loops)
@@ -244,6 +286,13 @@ class LLMEngine:
                     break
             self.speculative_runner.stats.committed_tokens += emitted
             self.speculative_runner.stats.accepted_tokens += min(result.accepted_count, emitted)
+            if batch.plan is not None:
+                k = batch.plan.config.num_speculative_tokens
+                committed.append(emitted)
+                censored.append(
+                    result.draft_count != k or remaining <= k + 1
+                    or reason == FinishReason.STOP or emitted != len(result.token_ids)
+                )
             if reason is not None:
                 self._finish(request, reason)
             else:
@@ -252,6 +301,34 @@ class LLMEngine:
                 request.loops_done = 0
                 self.scheduler.enqueue(request, Stage.SPECULATIVE)
             outputs.append(RequestOutput.from_request(request))
+        if batch.plan is not None:
+            feedback = RoundFeedback(
+                plan=batch.plan,
+                request_ids=tuple(item.request.request_id for item in batch.items),
+                actual_k=tuple(result.draft_count for result in results),
+                accepted_verified=tuple(result.accepted_count for result in results),
+                accepted_committed=tuple(
+                    min(result.accepted_count, emitted)
+                    for result, emitted in zip(results, committed)
+                ),
+                emitted=tuple(committed),
+                censored=tuple(censored),
+            )
+            controller = self.adaptive_controller
+            controller.observe(feedback)
+            window = self._adaptive_window
+            window["plan_ids"].append(batch.plan.plan_id)
+            window["committed"] += sum(committed)
+            if controller.window_ready(batch.plan):
+                # execute already materialized GPU results as Python tokens.
+                # This wall window includes schedule/execute/commit and any
+                # intervening engine work, with no extra per-round GPU fence.
+                controller.observe_window(WindowMeasurement(
+                    window_id=window["id"], plan_ids=tuple(window["plan_ids"]),
+                    committed_tokens=window["committed"],
+                    elapsed_seconds=perf_counter() - window["started"],
+                ))
+                self._adaptive_window = None
         return outputs
 
     def _update(self, batch, result) -> list[RequestOutput]:

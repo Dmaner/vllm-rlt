@@ -46,6 +46,10 @@ def main():
         parser.error("--toy uses built-in token ID prompts; omit --prompt")
     if not args.toy and not args.prompt:
         parser.error("provide --prompt or use --toy for a CPU smoke test")
+    try:
+        configs = runtime_configs(args)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     torch.manual_seed(args.seed)
     model = (
         OuroForCausalLM(OuroConfig.tiny()).to(device=args.device, dtype=getattr(torch, args.dtype))
@@ -57,7 +61,7 @@ def main():
         revision=args.revision,
         device=args.device,
         dtype=getattr(torch, args.dtype),
-        **runtime_configs(args),
+        **configs,
         scheduler_config=SchedulerConfig(
             policy=getattr(args, "scheduling_policy", "fcfs"),
             enable_preemption=getattr(args, "enable_preemption", False),

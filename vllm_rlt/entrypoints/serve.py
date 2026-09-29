@@ -15,6 +15,9 @@ from vllm_rlt.models.ouro import OuroForCausalLM
 
 
 def load_engine(args):
+    configs = getattr(args, "_runtime_configs", None)
+    if configs is None:
+        configs = runtime_configs(args)
     from tokenizers.decoders import ByteLevel
     from transformers import AutoTokenizer
 
@@ -30,9 +33,11 @@ def load_engine(args):
     model = OuroForCausalLM.from_pretrained(
         args.model, revision=revision, device=args.device, dtype=getattr(torch, args.dtype)
     )
+    object.__setattr__(model.config, "_model_name_or_path", args.model)
+    object.__setattr__(model.config, "_model_revision", revision)
     engine = LLMEngine(
         model,
-        **runtime_configs(args),
+        **configs,
         scheduler_config=SchedulerConfig(
             policy=getattr(args, "scheduling_policy", "fcfs"),
             enable_preemption=getattr(args, "enable_preemption", False),
@@ -83,6 +88,10 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     add_runtime_args(parser)
     args = parser.parse_args()
+    try:
+        args._runtime_configs = runtime_configs(args)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     limits = ServingLimits(**{name: getattr(args, name) for name in defaults})
     if args.device == "cpu" and args.attention_backend != "torch":
         parser.error("CPU execution requires --attention-backend torch")

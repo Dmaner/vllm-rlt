@@ -65,6 +65,9 @@ class SpeculativeRunner:
 
     @torch.inference_mode()
     def execute(self, batch):
+        # One immutable plan supplies both scheduling K and execution depth.
+        # Fixed decoding keeps the existing startup configuration.
+        config = batch.plan.config if batch.plan is not None else self.config
         items = batch.items
         candidates = [[] for _ in items]
         proposals = [[] for _ in items]
@@ -80,7 +83,7 @@ class SpeculativeRunner:
                 for i in active
             ]
             hidden = self.model.prelude(torch.tensor(tokens, device=self.device, dtype=torch.long))
-            for depth in range(self.config.draft_loops):
+            for depth in range(config.draft_loops):
                 hidden = self._core(hidden, ids, positions, depth)
             drafting = []
             for row, i in enumerate(active):
@@ -105,7 +108,7 @@ class SpeculativeRunner:
             ids.extend([item.request.request_id] * item.token_count)
             positions.extend(range(item.token_start, item.token_start + item.token_count))
         hidden = torch.stack([h for request_states in states for h in request_states])
-        for depth in range(self.config.draft_loops, self.config.target_loops):
+        for depth in range(config.draft_loops, config.target_loops):
             hidden = self._core(hidden, ids, positions, depth, packed=True)
         logits = self._coda(hidden)
         results, start = [], 0

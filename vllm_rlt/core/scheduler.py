@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 
+from vllm_rlt.adaptive import SpeculationPlan, WorkloadSnapshot
 from vllm_rlt.config import SchedulerConfig
 from vllm_rlt.core.scheduling_policy import NoRefillPolicy, RefillPolicy, SpeculativePolicy
 from vllm_rlt.request import FinishReason, Request, Stage
@@ -21,6 +22,7 @@ class ScheduledItem:
 class SchedulerOutput:
     stage: Stage
     items: list[ScheduledItem]
+    plan: SpeculationPlan | None = None
 
     @property
     def num_tokens(self) -> int:
@@ -68,6 +70,10 @@ class Scheduler:
         # device state and mutate queues; they are operations, not predicates.
         self.preempt_callback = None
         self.resume_callback = None
+        # Engine-owned controller runs here after choosing the stage, before
+        # dequeuing requests or allowing K to affect the executed batch size.
+        self.speculation_plan_callback = None
+        self._snapshot_id = 0
         policy_cls = NoRefillPolicy if config.mode == "no_refill" else RefillPolicy
         self.policy = (SpeculativePolicy if speculative_config else policy_cls)(config)
 
@@ -285,7 +291,7 @@ class Scheduler:
         waiting.extendleft(reversed(deferred))
 
     def _make_scheduled_item(
-        self, request: Request, stage: Stage, token_budget: int
+        self, request: Request, stage: Stage, token_budget: int, speculative_config=None
     ) -> ScheduledItem:
         """Bound one request's work without advancing its completed progress.
 
@@ -302,7 +308,8 @@ class Scheduler:
             # K candidates plus one bonus distribution. At the output limit,
             # K=0 is an ordinary fixed-depth step and needs no extra KV slot.
             remaining = request.sampling_params.max_tokens - len(request.generated_token_ids)
-            count = min(self.speculative_config.num_speculative_tokens + 1, remaining, token_budget)
+            config = speculative_config or self.speculative_config
+            count = min(config.num_speculative_tokens + 1, remaining, token_budget)
             return ScheduledItem(request, request.position, count)
         return ScheduledItem(request)
 
@@ -332,10 +339,27 @@ class Scheduler:
         items = []
         queue = self.queues[stage]
         remaining = len(queue)
+        plan = None
+        if stage == Stage.SPECULATIVE and queue and self.speculation_plan_callback is not None:
+            ready = [self.requests[rid] for rid in queue]
+            self._snapshot_id += 1
+            snapshot = WorkloadSnapshot(
+                snapshot_id=self._snapshot_id,
+                ready_request_ids=tuple(r.request_id for r in ready),
+                context_lengths=tuple(r.position + 1 for r in ready),
+                remaining_tokens=tuple(
+                    r.sampling_params.max_tokens - len(r.generated_token_ids) for r in ready
+                ),
+                token_budget=token_budget,
+                max_num_seqs=self.config.max_num_seqs,
+            )
+            plan = self.speculation_plan_callback(snapshot)
         while queue and token_budget and len(items) < self.config.max_num_seqs and remaining:
             remaining -= 1
             request = self.requests[queue.popleft()]
-            item = self._make_scheduled_item(request, stage, token_budget)
+            item = self._make_scheduled_item(
+                request, stage, token_budget, plan.config if plan is not None else None
+            )
             if stage in (Stage.PREFILL, Stage.PRELUDE, Stage.RECURRENT, Stage.SPECULATIVE):
                 frontier = (
                     item.token_start + item.token_count
@@ -352,7 +376,7 @@ class Scheduler:
         if not items:
             return None
         self.policy.record_batch(stage)
-        return SchedulerOutput(stage, items)
+        return SchedulerOutput(stage, items, plan)
 
     def schedule(self, *, prefer_recurrent=False) -> SchedulerOutput | None:
         """Choose existing work or an admission opportunity, then build a batch.

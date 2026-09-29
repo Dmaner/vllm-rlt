@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "mode": "adaptive",
+  "policy": "coordinate_search",
+  "parameters": {
+    "num_speculative_tokens": {
+      "initial": 4,
+      "candidates": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "interval_batches": 10,
+      "min_samples": 10,
+      "cooldown_batches": 20
+    },
+    "draft_loops": {
+      "initial": 1,
+      "candidates": [
+        1,
+        2,
+        3
+      ],
+      "interval_batches": 100,
+      "min_samples": 10,
+      "cooldown_batches": 20
+    }
+  },
+  "workload": {
+    "ready_request_bucket_starts": [
+      1,
+      8,
+      32
+    ],
+    "context_length_bucket_starts": [
+      1,
+      256,
+      1024
+    ]
+  },
+  "feedback": {
+    "ema_alpha": 0.2,
+    "quality_change": {
+      "enabled": true,
+      "absolute_delta": 0.15,
+      "consecutive_windows": 3
+    }
+  },
+  "search": {
+    "objective": "committed_tokens_per_second",
+    "window_batches": 10,
+    "gain_margin": 0.05,
+    "max_trial_batches": 100
+  }
+}

@@ -5,17 +5,31 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from vllm_rlt.adaptive_config import ResolvedAdaptiveConfig, parse_adaptive_config
 from vllm_rlt.config import CacheConfig, ExecutionConfig, ExitConfig, SpeculativeConfig
 
 
+class _ExplicitSpeculativeArgument(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        flags = getattr(namespace, "_explicit_speculative_flags", ())
+        setattr(namespace, "_explicit_speculative_flags", (*flags, option_string))
+        setattr(namespace, self.dest, values)
+
+
 def add_runtime_args(parser):
+    parser.set_defaults(_explicit_speculative_flags=())
+    parser.add_argument(
+        "--speculative-config",
+        help="Experimental adaptive configuration: inline JSON or @local.json; mode=adaptive",
+    )
     parser.add_argument(
         "--speculative-tokens",
         type=int,
+        action=_ExplicitSpeculativeArgument,
         help="Enable fixed-loop self-speculation with K draft tokens",
     )
-    parser.add_argument("--draft-loops", type=int, default=2)
-    parser.add_argument("--target-loops", type=int, default=4)
+    parser.add_argument("--draft-loops", type=int, default=2, action=_ExplicitSpeculativeArgument)
+    parser.add_argument("--target-loops", type=int, default=4, action=_ExplicitSpeculativeArgument)
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--incremental-kv", action="store_true")
     parser.add_argument("--kv-watermark", type=float, default=0.0)
@@ -54,11 +68,27 @@ def add_runtime_args(parser):
 
 
 def runtime_configs(args):
+    adaptive = getattr(args, "speculative_config", None)
+    if adaptive is not None:
+        explicit = getattr(args, "_explicit_speculative_flags", None)
+        if explicit is None:
+            # For direct Namespace callers there is no parser provenance; supplied
+            # legacy fields count as explicit rather than guessing from their values.
+            explicit = tuple(
+                "--" + name.replace("_", "-")
+                for name in ("speculative_tokens", "draft_loops", "target_loops")
+                if name in vars(args) and getattr(args, name) is not None
+            )
+        if explicit:
+            raise ValueError("--speculative-config conflicts with " + ", ".join(explicit))
+        if not isinstance(adaptive, ResolvedAdaptiveConfig):
+            adaptive = parse_adaptive_config(adaptive)
     # load_engine is also called directly with older argparse namespaces.
     parser = argparse.ArgumentParser(add_help=False)
     add_runtime_args(parser)
     args = SimpleNamespace(**(vars(parser.parse_args([])) | vars(args)))
     return dict(
+        adaptive_config=adaptive,
         speculative_config=SpeculativeConfig(
             num_speculative_tokens=args.speculative_tokens,
             draft_loops=args.draft_loops,

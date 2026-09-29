@@ -3,6 +3,7 @@ from dataclasses import replace
 import torch
 
 from vllm_rlt.engine.llm_engine import LLMEngine
+from vllm_rlt.models.config import OURO_MODEL_ID, OURO_REVISION
 from vllm_rlt.models.ouro import OuroForCausalLM
 from vllm_rlt.sampling_params import SamplingParams
 
@@ -24,6 +25,7 @@ class LLM:
         exit_config=None,
         execution_config=None,
         speculative_config=None,
+        adaptive_config=None,
     ):
         self._tokenizer_source = None
         if isinstance(model, str):
@@ -31,12 +33,15 @@ class LLM:
             model = OuroForCausalLM.from_pretrained(
                 model_name, revision=revision, device=device, dtype=dtype
             )
+            object.__setattr__(model.config, "_model_name_or_path", model_name)
+            object.__setattr__(
+                model.config, "_model_revision",
+                revision or (OURO_REVISION if model_name == OURO_MODEL_ID else None),
+            )
             if tokenizer is None:
-                from vllm_rlt.models.ouro import OURO_REVISION
-
                 self._tokenizer_source = (
                     model_name,
-                    revision or (OURO_REVISION if model_name == "ByteDance/Ouro-1.4B" else None),
+                    revision or (OURO_REVISION if model_name == OURO_MODEL_ID else None),
                 )
         self.tokenizer = tokenizer
         self.engine = LLMEngine(
@@ -47,6 +52,7 @@ class LLM:
             exit_config=exit_config,
             execution_config=execution_config,
             speculative_config=speculative_config,
+            adaptive_config=adaptive_config,
         )
         self._next_request_id = 0
 

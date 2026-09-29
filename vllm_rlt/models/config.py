@@ -4,7 +4,8 @@
 """Native configuration for the first supported checkpoint, ByteDance/Ouro-1.4B."""
 
 import math
-from dataclasses import asdict, dataclass, fields
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 OURO_MODEL_ID = "ByteDance/Ouro-1.4B"
@@ -36,6 +37,11 @@ class OuroConfig:
     use_sliding_window: bool = False
     sliding_window: int | None = None
     layer_types: list[str] | None = None
+    # Inert deployment metadata, isolated from the model architecture parser.
+    _adaptive_spec_config: Any = field(default=None, init=False, repr=False, compare=False)
+    _has_adaptive_spec_config: bool = field(default=False, init=False, repr=False, compare=False)
+    _model_name_or_path: str | None = field(default=None, init=False, repr=False, compare=False)
+    _model_revision: str | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name in (
@@ -108,7 +114,7 @@ class OuroConfig:
             raise ValueError("Only model_type='ouro' is supported")
         if values.get("architectures", ["OuroForCausalLM"]) != ["OuroForCausalLM"]:
             raise ValueError("Only the OuroForCausalLM architecture is supported")
-        names = {field.name for field in fields(cls)}
+        names = {field.name for field in fields(cls) if field.init}
         metadata = {
             "architectures",
             "auto_map",
@@ -119,6 +125,7 @@ class OuroConfig:
             "max_window_layers",
             "use_cache",
             "_name_or_path",
+            "adaptive_spec_config",
         }
         unknown = values.keys() - names - metadata
         if unknown:
@@ -133,7 +140,17 @@ class OuroConfig:
             config_values["num_key_value_heads"] = config_values.get(
                 "num_attention_heads", cls.num_attention_heads
             )
-        return cls(**config_values)
+        config = cls(**config_values)
+        if "adaptive_spec_config" in values:
+            object.__setattr__(config, "_has_adaptive_spec_config", True)
+            object.__setattr__(
+                config, "_adaptive_spec_config", deepcopy(values["adaptive_spec_config"])
+            )
+        object.__setattr__(config, "_model_name_or_path", values.get("_name_or_path"))
+        return config
 
     def to_dict(self) -> dict[str, Any]:
-        return {"model_type": "ouro", "architectures": ["OuroForCausalLM"], **asdict(self)}
+        values = {key: value for key, value in asdict(self).items() if not key.startswith("_")}
+        if self._has_adaptive_spec_config:
+            values["adaptive_spec_config"] = deepcopy(self._adaptive_spec_config)
+        return {"model_type": "ouro", "architectures": ["OuroForCausalLM"], **values}
